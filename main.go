@@ -7,6 +7,7 @@ import (
     "crypto/mlkem"
     "crypto/rand"
     "crypto/sha256"
+    "crypto/subtle"
     "encoding/binary"
     "encoding/hex"
     "encoding/json"
@@ -21,13 +22,22 @@ import (
     "time"
 )
 
+const (
+    maxMessageSize   = 100 * 1024 * 1024
+    handshakeTimeout = 30 * time.Second
+    readTimeout      = 5 * time.Minute
+    writeTimeout     = 5 * time.Minute
+    maxFilePath      = 4096
+    maxConcurrent    = 100
+)
+
 type Message struct {
     Type      string          `json:"type"`
     Sender    string          `json:"sender"`
     Recipient string          `json:"recipient"`
     Timestamp int64           `json:"timestamp"`
     Payload   json.RawMessage `json:"payload"`
-    Signature string          `json:"signature"`
+    Signature string          `json:"signature,omitempty"`
 }
 
 type FileMetadata struct {
@@ -50,6 +60,7 @@ type SecureChannel struct {
     sharedSecret []byte
     sendNonce    uint64
     recvNonce    uint64
+    mu           sync.Mutex
 }
 
 func NewSecureChannel(conn net.Conn, secret []byte) *SecureChannel {
@@ -62,11 +73,24 @@ func NewSecureChannel(conn net.Conn, secret []byte) *SecureChannel {
 }
 
 func (sc *SecureChannel) EncryptAndSend(data []byte) error {
+    sc.mu.Lock()
+    defer sc.mu.Unlock()
+
+    if len(data) > maxMessageSize {
+        return fmt.Errorf("message too large")
+    }
+
+    sc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+
     nonce := make([]byte, 12)
+    if sc.sendNonce == ^uint64(0) {
+        return fmt.Errorf("nonce overflow")
+    }
     binary.BigEndian.PutUint64(nonce[4:], sc.sendNonce)
     sc.sendNonce++
 
-    block, err := aes.NewCipher(sc.sharedSecret[:16])
+    key := sha256.Sum256(sc.sharedSecret)
+    block, err := aes.NewCipher(key[:16])
     if err != nil {
         return err
     }
@@ -76,11 +100,12 @@ func (sc *SecureChannel) EncryptAndSend(data []byte) error {
         return err
     }
 
-    mac := hmac.New(sha256.New, sc.sharedSecret[16:32])
+    macKey := key[16:]
+    mac := hmac.New(sha256.New, macKey)
     mac.Write(data)
     signature := mac.Sum(nil)
 
-    payload := make([]byte, 0)
+    payload := make([]byte, 0, len(data)+len(signature))
     payload = append(payload, data...)
     payload = append(payload, signature...)
 
@@ -100,9 +125,18 @@ func (sc *SecureChannel) EncryptAndSend(data []byte) error {
 }
 
 func (sc *SecureChannel) ReceiveAndDecrypt() ([]byte, error) {
+    sc.mu.Lock()
+    defer sc.mu.Unlock()
+
+    sc.conn.SetReadDeadline(time.Now().Add(readTimeout))
+
     var length uint32
     if err := binary.Read(sc.conn, binary.BigEndian, &length); err != nil {
         return nil, err
+    }
+
+    if length > maxMessageSize {
+        return nil, fmt.Errorf("message too large: %d bytes", length)
     }
 
     nonce := make([]byte, 12)
@@ -120,10 +154,11 @@ func (sc *SecureChannel) ReceiveAndDecrypt() ([]byte, error) {
 
     actualNonce := binary.BigEndian.Uint64(nonce[4:])
     if actualNonce != expectedNonce {
-        return nil, fmt.Errorf("nonce mismatch")
+        return nil, fmt.Errorf("nonce mismatch: got %d, want %d", actualNonce, expectedNonce)
     }
 
-    block, err := aes.NewCipher(sc.sharedSecret[:16])
+    key := sha256.Sum256(sc.sharedSecret)
+    block, err := aes.NewCipher(key[:16])
     if err != nil {
         return nil, err
     }
@@ -138,18 +173,19 @@ func (sc *SecureChannel) ReceiveAndDecrypt() ([]byte, error) {
         return nil, err
     }
 
-    if len(payload) < 32 {
+    if len(payload) < sha256.Size {
         return nil, fmt.Errorf("payload too short")
     }
 
-    data := payload[:len(payload)-32]
-    receivedSignature := payload[len(payload)-32:]
+    data := payload[:len(payload)-sha256.Size]
+    receivedSignature := payload[len(payload)-sha256.Size:]
 
-    mac := hmac.New(sha256.New, sc.sharedSecret[16:32])
+    macKey := key[16:]
+    mac := hmac.New(sha256.New, macKey)
     mac.Write(data)
     expectedSignature := mac.Sum(nil)
 
-    if !hmac.Equal(receivedSignature, expectedSignature) {
+    if subtle.ConstantTimeCompare(receivedSignature, expectedSignature) != 1 {
         return nil, fmt.Errorf("signature mismatch")
     }
 
@@ -157,27 +193,33 @@ func (sc *SecureChannel) ReceiveAndDecrypt() ([]byte, error) {
 }
 
 type SecureFileTransfer struct {
-    channel    *SecureChannel
-    workingDir string
-    sessionID  string
+    channel     *SecureChannel
+    workingDir  string
+    sessionID   string
+    rateLimiter chan struct{}
 }
 
 func NewSecureFileTransfer(channel *SecureChannel, workingDir string) *SecureFileTransfer {
     sessionID := make([]byte, 16)
-    rand.Read(sessionID)
+    if _, err := rand.Read(sessionID); err != nil {
+        sessionID = []byte("fallback-session-id")
+    }
 
     return &SecureFileTransfer{
-        channel:    channel,
-        workingDir: workingDir,
-        sessionID:  hex.EncodeToString(sessionID),
+        channel:     channel,
+        workingDir:  workingDir,
+        sessionID:   hex.EncodeToString(sessionID),
+        rateLimiter: make(chan struct{}, maxConcurrent),
     }
 }
 
 func (sft *SecureFileTransfer) HandleClient() error {
+    defer close(sft.rateLimiter)
+
     for {
         data, err := sft.channel.ReceiveAndDecrypt()
         if err != nil {
-            if err != io.EOF {
+            if err != io.EOF && !strings.Contains(err.Error(), "timeout") {
                 log.Printf("Receive error: %v", err)
             }
             return err
@@ -186,41 +228,88 @@ func (sft *SecureFileTransfer) HandleClient() error {
         var msg Message
         if err := json.Unmarshal(data, &msg); err != nil {
             log.Printf("JSON unmarshal error: %v", err)
+            sft.sendError("invalid message format")
             continue
         }
 
-        switch msg.Type {
-        case "LIST_DIR":
-            sft.handleListDirectory(msg)
-        case "GET_FILE":
-            sft.handleGetFile(msg)
-        case "PUT_FILE":
-            sft.handlePutFile(msg)
-        case "DELETE_FILE":
-            sft.handleDeleteFile(msg)
-        case "MOVE_FILE":
-            sft.handleMoveFile(msg)
-        case "SEARCH":
-            sft.handleSearch(msg)
-        case "BATCH":
-            sft.handleBatchOperation(msg)
-        case "CLOSE":
-            return nil
+        select {
+        case sft.rateLimiter <- struct{}{}:
+            go func() {
+                defer func() { <-sft.rateLimiter }()
+                sft.handleMessage(msg)
+            }()
+        default:
+            sft.sendError("server busy")
         }
     }
+}
+
+func (sft *SecureFileTransfer) handleMessage(msg Message) {
+    switch msg.Type {
+    case "LIST_DIR":
+        sft.handleListDirectory(msg)
+    case "GET_FILE":
+        sft.handleGetFile(msg)
+    case "PUT_FILE":
+        sft.handlePutFile(msg)
+    case "DELETE_FILE":
+        sft.handleDeleteFile(msg)
+    case "MOVE_FILE":
+        sft.handleMoveFile(msg)
+    case "SEARCH":
+        sft.handleSearch(msg)
+    case "BATCH":
+        sft.handleBatchOperation(msg)
+    case "CLOSE":
+        return
+    default:
+        sft.sendError("unknown command")
+    }
+}
+
+func (sft *SecureFileTransfer) securePath(userPath string) (string, error) {
+    if len(userPath) > maxFilePath {
+        return "", fmt.Errorf("path too long")
+    }
+
+    cleanPath := filepath.Clean(userPath)
+    fullPath := filepath.Join(sft.workingDir, cleanPath)
+
+    if !strings.HasPrefix(fullPath, filepath.Clean(sft.workingDir)+string(os.PathSeparator)) &&
+        fullPath != filepath.Clean(sft.workingDir) {
+        return "", fmt.Errorf("path traversal detected")
+    }
+
+    return fullPath, nil
 }
 
 func (sft *SecureFileTransfer) handleListDirectory(msg Message) {
     var path string
     if err := json.Unmarshal(msg.Payload, &path); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid path format")
         return
     }
 
-    fullPath := filepath.Join(sft.workingDir, path)
+    fullPath, err := sft.securePath(path)
+    if err != nil {
+        sft.sendError("invalid path")
+        return
+    }
+
+    info, err := os.Stat(fullPath)
+    if err != nil {
+        sft.sendError("path not accessible")
+        return
+    }
+
+    if !info.IsDir() {
+        sft.sendError("not a directory")
+        return
+    }
+
     entries, err := os.ReadDir(fullPath)
     if err != nil {
-        sft.sendError(err)
+        sft.sendError("cannot read directory")
         return
     }
 
@@ -257,17 +346,7 @@ func (sft *SecureFileTransfer) handleListDirectory(msg Message) {
         FileCount: len(files),
     }
 
-    payload, _ := json.Marshal(listing)
-    response := Message{
-        Type:      "LIST_RESULT",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   payload,
-    }
-
-    responseData, _ := json.Marshal(response)
-    sft.channel.EncryptAndSend(responseData)
+    sft.sendResponse("LIST_RESULT", msg.Sender, listing)
 }
 
 func (sft *SecureFileTransfer) handleGetFile(msg Message) {
@@ -278,26 +357,39 @@ func (sft *SecureFileTransfer) handleGetFile(msg Message) {
     }
 
     if err := json.Unmarshal(msg.Payload, &fileInfo); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid request format")
         return
     }
 
-    fullPath := filepath.Join(sft.workingDir, fileInfo.Path)
+    fullPath, err := sft.securePath(fileInfo.Path)
+    if err != nil {
+        sft.sendError("invalid path")
+        return
+    }
+
     file, err := os.Open(fullPath)
     if err != nil {
-        sft.sendError(err)
+        sft.sendError("file not accessible")
         return
     }
     defer file.Close()
 
     info, err := file.Stat()
     if err != nil {
-        sft.sendError(err)
+        sft.sendError("cannot access file info")
         return
     }
-    _ = info
+
+    if info.IsDir() {
+        sft.sendError("cannot get directory")
+        return
+    }
 
     if fileInfo.Resume {
+        if fileInfo.Offset > info.Size() {
+            sft.sendError("invalid offset")
+            return
+        }
         file.Seek(fileInfo.Offset, 0)
     }
 
@@ -307,61 +399,17 @@ func (sft *SecureFileTransfer) handleGetFile(msg Message) {
     for {
         n, err := file.Read(chunk)
         if n > 0 {
-            chunkData := struct {
-                Path   string `json:"path"`
-                Offset int64  `json:"offset"`
-                Data   []byte `json:"data"`
-                Eof    bool   `json:"eof"`
-            }{
-                Path:   fileInfo.Path,
-                Offset: offset,
-                Data:   chunk[:n],
-                Eof:    false,
-            }
-
-            payload, _ := json.Marshal(chunkData)
-            response := Message{
-                Type:      "FILE_CHUNK",
-                Sender:    "server",
-                Recipient: msg.Sender,
-                Timestamp: time.Now().Unix(),
-                Payload:   payload,
-            }
-
-            responseData, _ := json.Marshal(response)
-            sft.channel.EncryptAndSend(responseData)
+            sft.sendFileChunk(fileInfo.Path, offset, chunk[:n], false, msg.Sender)
             offset += int64(n)
         }
 
         if err == io.EOF {
-            chunkData := struct {
-                Path   string `json:"path"`
-                Offset int64  `json:"offset"`
-                Data   []byte `json:"data"`
-                Eof    bool   `json:"eof"`
-            }{
-                Path:   fileInfo.Path,
-                Offset: offset,
-                Data:   []byte{},
-                Eof:    true,
-            }
-
-            payload, _ := json.Marshal(chunkData)
-            response := Message{
-                Type:      "FILE_CHUNK",
-                Sender:    "server",
-                Recipient: msg.Sender,
-                Timestamp: time.Now().Unix(),
-                Payload:   payload,
-            }
-
-            responseData, _ := json.Marshal(response)
-            sft.channel.EncryptAndSend(responseData)
+            sft.sendFileChunk(fileInfo.Path, offset, []byte{}, true, msg.Sender)
             break
         }
 
         if err != nil {
-            sft.sendError(err)
+            sft.sendError("read error")
             return
         }
     }
@@ -376,29 +424,31 @@ func (sft *SecureFileTransfer) handlePutFile(msg Message) {
     }
 
     if err := json.Unmarshal(msg.Payload, &fileInfo); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid request format")
         return
     }
 
-    fullPath := filepath.Join(sft.workingDir, fileInfo.Path)
+    if fileInfo.Size > maxMessageSize*10 {
+        sft.sendError("file too large")
+        return
+    }
+
+    fullPath, err := sft.securePath(fileInfo.Path)
+    if err != nil {
+        sft.sendError("invalid path")
+        return
+    }
+
     os.MkdirAll(filepath.Dir(fullPath), 0755)
 
     file, err := os.Create(fullPath)
     if err != nil {
-        sft.sendError(err)
+        sft.sendError("cannot create file")
         return
     }
     defer file.Close()
 
-    ack := Message{
-        Type:      "PUT_ACK",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   json.RawMessage(`{"ready":true}`),
-    }
-    ackData, _ := json.Marshal(ack)
-    sft.channel.EncryptAndSend(ackData)
+    sft.sendResponse("PUT_ACK", msg.Sender, map[string]bool{"ready": true})
 
     h := sha256.New()
     writer := io.MultiWriter(file, h)
@@ -406,74 +456,82 @@ func (sft *SecureFileTransfer) handlePutFile(msg Message) {
     for i := 0; i < fileInfo.Chunks; i++ {
         data, err := sft.channel.ReceiveAndDecrypt()
         if err != nil {
-            sft.sendError(err)
+            sft.sendError("transfer failed")
+            os.Remove(fullPath)
             return
         }
 
         var chunkMsg Message
-        json.Unmarshal(data, &chunkMsg)
+        if err := json.Unmarshal(data, &chunkMsg); err != nil {
+            sft.sendError("invalid chunk format")
+            os.Remove(fullPath)
+            return
+        }
 
         var chunk struct {
             Data  []byte `json:"data"`
             Index int    `json:"index"`
         }
-        json.Unmarshal(chunkMsg.Payload, &chunk)
-
-        writer.Write(chunk.Data)
-
-        progress := Message{
-            Type:      "PUT_PROGRESS",
-            Sender:    "server",
-            Recipient: msg.Sender,
-            Timestamp: time.Now().Unix(),
-            Payload:   json.RawMessage(fmt.Sprintf(`{"received":%d,"total":%d}`, i+1, fileInfo.Chunks)),
+        if err := json.Unmarshal(chunkMsg.Payload, &chunk); err != nil {
+            sft.sendError("invalid chunk data")
+            os.Remove(fullPath)
+            return
         }
-        progressData, _ := json.Marshal(progress)
-        sft.channel.EncryptAndSend(progressData)
+
+        if _, err := writer.Write(chunk.Data); err != nil {
+            sft.sendError("write error")
+            os.Remove(fullPath)
+            return
+        }
+
+        sft.sendResponse("PUT_PROGRESS", msg.Sender, map[string]int{
+            "received": i + 1,
+            "total":    fileInfo.Chunks,
+        })
     }
 
     computedHash := hex.EncodeToString(h.Sum(nil))
-    if computedHash != fileInfo.Hash {
+    if subtle.ConstantTimeCompare([]byte(computedHash), []byte(fileInfo.Hash)) != 1 {
         os.Remove(fullPath)
-        sft.sendError(fmt.Errorf("hash mismatch"))
+        sft.sendError("hash mismatch")
         return
     }
 
-    result := Message{
-        Type:      "PUT_COMPLETE",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   json.RawMessage(fmt.Sprintf(`{"hash":"%s"}`, computedHash)),
-    }
-    resultData, _ := json.Marshal(result)
-    sft.channel.EncryptAndSend(resultData)
+    sft.sendResponse("PUT_COMPLETE", msg.Sender, map[string]string{"hash": computedHash})
 }
 
 func (sft *SecureFileTransfer) handleDeleteFile(msg Message) {
     var path string
     if err := json.Unmarshal(msg.Payload, &path); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid path format")
         return
     }
 
-    fullPath := filepath.Join(sft.workingDir, path)
-    err := os.Remove(fullPath)
-
+    fullPath, err := sft.securePath(path)
     if err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid path")
         return
     }
 
-    result := Message{
-        Type:      "DELETE_COMPLETE",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   json.RawMessage(`{"deleted":"` + path + `"}`),
+    info, err := os.Stat(fullPath)
+    if err != nil {
+        sft.sendError("path not accessible")
+        return
     }
-    resultData, _ := json.Marshal(result)
-    sft.channel.EncryptAndSend(resultData)
+
+    if info.IsDir() {
+        if err := os.RemoveAll(fullPath); err != nil {
+            sft.sendError("cannot remove directory")
+            return
+        }
+    } else {
+        if err := os.Remove(fullPath); err != nil {
+            sft.sendError("cannot remove file")
+            return
+        }
+    }
+
+    sft.sendResponse("DELETE_COMPLETE", msg.Sender, map[string]string{"deleted": path})
 }
 
 func (sft *SecureFileTransfer) handleMoveFile(msg Message) {
@@ -483,30 +541,35 @@ func (sft *SecureFileTransfer) handleMoveFile(msg Message) {
     }
 
     if err := json.Unmarshal(msg.Payload, &paths); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid request format")
         return
     }
 
-    sourcePath := filepath.Join(sft.workingDir, paths.Source)
-    destPath := filepath.Join(sft.workingDir, paths.Dest)
+    sourcePath, err := sft.securePath(paths.Source)
+    if err != nil {
+        sft.sendError("invalid source path")
+        return
+    }
+
+    destPath, err := sft.securePath(paths.Dest)
+    if err != nil {
+        sft.sendError("invalid destination path")
+        return
+    }
+
+    if _, err := os.Stat(sourcePath); err != nil {
+        sft.sendError("source not accessible")
+        return
+    }
 
     os.MkdirAll(filepath.Dir(destPath), 0755)
-    err := os.Rename(sourcePath, destPath)
 
-    if err != nil {
-        sft.sendError(err)
+    if err := os.Rename(sourcePath, destPath); err != nil {
+        sft.sendError("move failed")
         return
     }
 
-    result := Message{
-        Type:      "MOVE_COMPLETE",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   json.RawMessage(`{"moved":true}`),
-    }
-    resultData, _ := json.Marshal(result)
-    sft.channel.EncryptAndSend(resultData)
+    sft.sendResponse("MOVE_COMPLETE", msg.Sender, map[string]bool{"moved": true})
 }
 
 func (sft *SecureFileTransfer) handleSearch(msg Message) {
@@ -518,83 +581,83 @@ func (sft *SecureFileTransfer) handleSearch(msg Message) {
     }
 
     if err := json.Unmarshal(msg.Payload, &searchQuery); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid search query")
         return
     }
 
     var results []FileMetadata
+    var resultsMu sync.Mutex
+    var wg sync.WaitGroup
+    semaphore := make(chan struct{}, 10)
 
     filepath.Walk(sft.workingDir, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
+        if err != nil || info.IsDir() {
             return nil
         }
 
-        if info.IsDir() {
-            return nil
-        }
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            semaphore <- struct{}{}
+            defer func() { <-semaphore }()
 
-        relPath, _ := filepath.Rel(sft.workingDir, path)
+            relPath, _ := filepath.Rel(sft.workingDir, path)
 
-        if searchQuery.Pattern != "" {
-            matched, _ := filepath.Match(searchQuery.Pattern, info.Name())
-            if !matched && !strings.Contains(relPath, searchQuery.Pattern) {
-                return nil
+            if searchQuery.Pattern != "" {
+                matched, _ := filepath.Match(searchQuery.Pattern, info.Name())
+                if !matched && !strings.Contains(relPath, searchQuery.Pattern) {
+                    return
+                }
             }
-        }
 
-        if searchQuery.MinSize > 0 && info.Size() < searchQuery.MinSize {
-            return nil
-        }
+            if searchQuery.MinSize > 0 && info.Size() < searchQuery.MinSize {
+                return
+            }
 
-        if searchQuery.MaxSize > 0 && info.Size() > searchQuery.MaxSize {
-            return nil
-        }
+            if searchQuery.MaxSize > 0 && info.Size() > searchQuery.MaxSize {
+                return
+            }
 
-        tags := sft.generateTags(info.Name())
-        if len(searchQuery.Tags) > 0 {
-            found := false
-            for _, requiredTag := range searchQuery.Tags {
-                for _, fileTag := range tags {
-                    if requiredTag == fileTag {
-                        found = true
+            tags := sft.generateTags(info.Name())
+            if len(searchQuery.Tags) > 0 {
+                tagMatch := false
+                for _, requiredTag := range searchQuery.Tags {
+                    for _, fileTag := range tags {
+                        if requiredTag == fileTag {
+                            tagMatch = true
+                            break
+                        }
+                    }
+                    if tagMatch {
                         break
                     }
                 }
-                if found {
-                    break
+                if !tagMatch {
+                    return
                 }
             }
-            if !found {
-                return nil
-            }
-        }
 
-        h := sha256.New()
-        file, _ := os.Open(path)
-        io.Copy(h, file)
-        file.Close()
+            h := sha256.New()
+            file, _ := os.Open(path)
+            io.Copy(h, file)
+            file.Close()
 
-        results = append(results, FileMetadata{
-            Name:        relPath,
-            Size:        info.Size(),
-            Hash:        hex.EncodeToString(h.Sum(nil)),
-            Permissions: int(info.Mode().Perm()),
-            Tags:        tags,
-        })
+            resultsMu.Lock()
+            results = append(results, FileMetadata{
+                Name:        relPath,
+                Size:        info.Size(),
+                Hash:        hex.EncodeToString(h.Sum(nil)),
+                Permissions: int(info.Mode().Perm()),
+                Tags:        tags,
+            })
+            resultsMu.Unlock()
+        }()
 
         return nil
     })
 
-    payload, _ := json.Marshal(results)
-    response := Message{
-        Type:      "SEARCH_RESULT",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   payload,
-    }
-    responseData, _ := json.Marshal(response)
-    sft.channel.EncryptAndSend(responseData)
+    wg.Wait()
+    sft.sendResponse("SEARCH_RESULT", msg.Sender, results)
 }
 
 func (sft *SecureFileTransfer) handleBatchOperation(msg Message) {
@@ -604,71 +667,147 @@ func (sft *SecureFileTransfer) handleBatchOperation(msg Message) {
     }
 
     if err := json.Unmarshal(msg.Payload, &operations); err != nil {
-        sft.sendError(err)
+        sft.sendError("invalid batch format")
         return
     }
 
-    results := make([]map[string]interface{}, 0)
+    results := make([]map[string]interface{}, 0, len(operations))
 
     for _, op := range operations {
+        result := map[string]interface{}{
+            "operation": op.Type,
+        }
+
         switch op.Type {
-        case "GET_FILE":
+        case "GET_FILE_INFO":
             var path string
-            json.Unmarshal(op.Params, &path)
-            fullPath := filepath.Join(sft.workingDir, path)
-            info, _ := os.Stat(fullPath)
-            _ = info
-            results = append(results, map[string]interface{}{
-                "operation": "GET_FILE",
-                "path":      path,
-                "exists":    info != nil,
-            })
+            if err := json.Unmarshal(op.Params, &path); err != nil {
+                result["error"] = "invalid path"
+            } else {
+                fullPath, err := sft.securePath(path)
+                if err != nil {
+                    result["error"] = "invalid path"
+                } else {
+                    info, err := os.Stat(fullPath)
+                    if err != nil {
+                        result["error"] = "not accessible"
+                        result["exists"] = false
+                    } else {
+                        result["exists"] = true
+                        result["is_dir"] = info.IsDir()
+                        result["size"] = info.Size()
+                        result["mode"] = info.Mode().String()
+                    }
+                }
+            }
 
         case "DELETE_FILE":
             var path string
-            json.Unmarshal(op.Params, &path)
-            fullPath := filepath.Join(sft.workingDir, path)
-            err := os.Remove(fullPath)
-            results = append(results, map[string]interface{}{
-                "operation": "DELETE_FILE",
-                "path":      path,
-                "success":   err == nil,
-            })
+            if err := json.Unmarshal(op.Params, &path); err != nil {
+                result["error"] = "invalid path"
+                result["success"] = false
+            } else {
+                fullPath, err := sft.securePath(path)
+                if err != nil {
+                    result["error"] = "invalid path"
+                    result["success"] = false
+                } else {
+                    err := os.Remove(fullPath)
+                    result["success"] = err == nil
+                    if err != nil {
+                        result["error"] = err.Error()
+                    }
+                }
+            }
 
         case "CREATE_DIR":
             var path string
-            json.Unmarshal(op.Params, &path)
-            fullPath := filepath.Join(sft.workingDir, path)
-            err := os.MkdirAll(fullPath, 0755)
-            results = append(results, map[string]interface{}{
-                "operation": "CREATE_DIR",
-                "path":      path,
-                "success":   err == nil,
-            })
+            if err := json.Unmarshal(op.Params, &path); err != nil {
+                result["error"] = "invalid path"
+                result["success"] = false
+            } else {
+                fullPath, err := sft.securePath(path)
+                if err != nil {
+                    result["error"] = "invalid path"
+                    result["success"] = false
+                } else {
+                    err := os.MkdirAll(fullPath, 0755)
+                    result["success"] = err == nil
+                    if err != nil {
+                        result["error"] = err.Error()
+                    }
+                }
+            }
+
+        default:
+            result["error"] = "unknown operation"
         }
+
+        results = append(results, result)
     }
 
-    payload, _ := json.Marshal(results)
-    response := Message{
-        Type:      "BATCH_RESULT",
-        Sender:    "server",
-        Recipient: msg.Sender,
-        Timestamp: time.Now().Unix(),
-        Payload:   payload,
-    }
-    responseData, _ := json.Marshal(response)
-    sft.channel.EncryptAndSend(responseData)
+    sft.sendResponse("BATCH_RESULT", msg.Sender, results)
 }
 
-func (sft *SecureFileTransfer) sendError(err error) {
+func (sft *SecureFileTransfer) sendResponse(msgType, recipient string, payload interface{}) {
+    payloadData, err := json.Marshal(payload)
+    if err != nil {
+        log.Printf("Failed to marshal response: %v", err)
+        return
+    }
+
+    response := Message{
+        Type:      msgType,
+        Sender:    "server",
+        Recipient: recipient,
+        Timestamp: time.Now().Unix(),
+        Payload:   payloadData,
+    }
+
+    responseData, err := json.Marshal(response)
+    if err != nil {
+        log.Printf("Failed to marshal message: %v", err)
+        return
+    }
+
+    if err := sft.channel.EncryptAndSend(responseData); err != nil {
+        log.Printf("Failed to send response: %v", err)
+    }
+}
+
+func (sft *SecureFileTransfer) sendFileChunk(path string, offset int64, data []byte, eof bool, recipient string) {
+    chunkData := struct {
+        Path   string `json:"path"`
+        Offset int64  `json:"offset"`
+        Data   []byte `json:"data"`
+        Eof    bool   `json:"eof"`
+    }{
+        Path:   path,
+        Offset: offset,
+        Data:   data,
+        Eof:    eof,
+    }
+
+    sft.sendResponse("FILE_CHUNK", recipient, chunkData)
+}
+
+func (sft *SecureFileTransfer) sendError(errMsg string) {
     errorMsg := Message{
         Type:      "ERROR",
         Sender:    "server",
         Timestamp: time.Now().Unix(),
-        Payload:   json.RawMessage(`{"error":"` + err.Error() + `"}`),
+        Payload:   json.RawMessage(`{"error":"` + errMsg + `"}`),
     }
-    data, _ := json.Marshal(errorMsg)
-    sft.channel.EncryptAndSend(data)
+
+    data, err := json.Marshal(errorMsg)
+    if err != nil {
+        log.Printf("Failed to marshal error: %v", err)
+        return
+    }
+
+    if err := sft.channel.EncryptAndSend(data); err != nil {
+        log.Printf("Failed to send error: %v", err)
+    }
 }
 
 func (sft *SecureFileTransfer) generateTags(filename string) []string {
@@ -676,26 +815,34 @@ func (sft *SecureFileTransfer) generateTags(filename string) []string {
 
     ext := strings.ToLower(filepath.Ext(filename))
     switch ext {
-    case ".jpg", ".jpeg", ".png", ".gif":
+    case ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp":
         tags = append(tags, "image")
-    case ".pdf", ".doc", ".docx", ".txt":
+    case ".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt":
         tags = append(tags, "document")
-    case ".mp3", ".wav", ".flac":
+    case ".mp3", ".wav", ".flac", ".m4a", ".ogg":
         tags = append(tags, "audio")
-    case ".mp4", ".avi", ".mkv":
+    case ".mp4", ".avi", ".mkv", ".mov", ".wmv":
         tags = append(tags, "video")
-    case ".zip", ".tar", ".gz":
+    case ".zip", ".tar", ".gz", ".7z", ".rar":
         tags = append(tags, "archive")
+    case ".go", ".py", ".js", ".c", ".cpp", ".java":
+        tags = append(tags, "source")
+    case ".exe", ".bin", ".msi":
+        tags = append(tags, "executable")
     }
 
-    if strings.Contains(filename, "backup") {
+    lowerName := strings.ToLower(filename)
+    if strings.Contains(lowerName, "backup") {
         tags = append(tags, "backup")
     }
-    if strings.Contains(filename, "temp") {
+    if strings.Contains(lowerName, "temp") || strings.Contains(lowerName, "tmp") {
         tags = append(tags, "temporary")
     }
-    if strings.Contains(filename, "confidential") {
+    if strings.Contains(lowerName, "confidential") || strings.Contains(lowerName, "secret") {
         tags = append(tags, "confidential")
+    }
+    if strings.Contains(lowerName, "config") || strings.Contains(lowerName, "settings") {
+        tags = append(tags, "config")
     }
 
     return tags
@@ -723,11 +870,15 @@ func aliceServer(wg *sync.WaitGroup) {
     }
     defer listener.Close()
 
+    log.Println("Server listening on localhost:8080")
+
     conn, err := listener.Accept()
     if err != nil {
         log.Fatal(err)
     }
     defer conn.Close()
+
+    conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
     dkAlice, err := mlkem.GenerateKey768()
     if err != nil {
@@ -763,6 +914,8 @@ func aliceServer(wg *sync.WaitGroup) {
         log.Fatal(err)
     }
 
+    conn.SetDeadline(time.Time{})
+
     channel := NewSecureChannel(conn, sharedSecretAlice)
     transfer := NewSecureFileTransfer(channel, "./server_files")
 
@@ -788,6 +941,8 @@ func bobClient(wg *sync.WaitGroup) {
         log.Fatal("Failed to connect to server:", err)
     }
     defer conn.Close()
+
+    conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
     lenBuf := make([]byte, 2)
     if _, err := io.ReadFull(conn, lenBuf); err != nil {
@@ -819,12 +974,16 @@ func bobClient(wg *sync.WaitGroup) {
         log.Fatal(err)
     }
 
+    conn.SetDeadline(time.Time{})
+
     channel := NewSecureChannel(conn, sharedSecretBob)
 
     fmt.Println("Bob: Connected to secure file server")
 
     testFile := []byte("This is a confidential document\nProject X - Launch codes: 4792-8841-AA38\nBackup codes: 7721-3365-ZZ91")
-    os.WriteFile("./client_files/secret.txt", testFile, 0644)
+    if err := os.WriteFile("./client_files/secret.txt", testFile, 0644); err != nil {
+        log.Printf("Warning: Could not create test file: %v", err)
+    }
 
     listDirMsg := Message{
         Type:      "LIST_DIR",
