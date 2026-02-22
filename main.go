@@ -3,8 +3,8 @@ package main
 import (
     "crypto/aes"
     "crypto/cipher"
+    "crypto/ecdh"
     "crypto/hmac"
-    "crypto/mlkem"
     "crypto/rand"
     "crypto/sha256"
     "crypto/subtle"
@@ -85,6 +85,10 @@ func (sc *SecureChannel) EncryptAndSend(data []byte) error {
     nonce := make([]byte, 12)
     if sc.sendNonce == ^uint64(0) {
         return fmt.Errorf("nonce overflow")
+    }
+    
+    if _, err := rand.Read(nonce[:4]); err != nil {
+        return err
     }
     binary.BigEndian.PutUint64(nonce[4:], sc.sendNonce)
     sc.sendNonce++
@@ -234,10 +238,15 @@ func (sft *SecureFileTransfer) HandleClient() error {
 
         select {
         case sft.rateLimiter <- struct{}{}:
-            go func() {
-                defer func() { <-sft.rateLimiter }()
-                sft.handleMessage(msg)
-            }()
+            go func(currentMsg Message) {
+                defer func() {
+                    if r := recover(); r != nil {
+                        log.Printf("Recovered from panic: %v", r)
+                    }
+                    <-sft.rateLimiter
+                }()
+                sft.handleMessage(currentMsg)
+            }(msg)
         default:
             sft.sendError("server busy")
         }
@@ -325,8 +334,10 @@ func (sft *SecureFileTransfer) handleListDirectory(msg Message) {
         h := sha256.New()
         file, err := os.Open(filepath.Join(fullPath, entry.Name()))
         if err == nil {
-            io.Copy(h, file)
-            file.Close()
+            func() {
+                defer file.Close()
+                io.Copy(h, file)
+            }()
         }
 
         files = append(files, FileMetadata{
@@ -590,35 +601,40 @@ func (sft *SecureFileTransfer) handleSearch(msg Message) {
     var wg sync.WaitGroup
     semaphore := make(chan struct{}, 10)
 
-    filepath.Walk(sft.workingDir, func(path string, info os.FileInfo, err error) error {
-        if err != nil || info.IsDir() {
+    err := filepath.Walk(sft.workingDir, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            log.Printf("Walk error at %s: %v", path, err)
+            return nil
+        }
+        
+        if info.IsDir() {
             return nil
         }
 
         wg.Add(1)
-        go func() {
+        go func(currentPath string, fileInfo os.FileInfo) {
             defer wg.Done()
             semaphore <- struct{}{}
             defer func() { <-semaphore }()
 
-            relPath, _ := filepath.Rel(sft.workingDir, path)
+            relPath, _ := filepath.Rel(sft.workingDir, currentPath)
 
             if searchQuery.Pattern != "" {
-                matched, _ := filepath.Match(searchQuery.Pattern, info.Name())
+                matched, _ := filepath.Match(searchQuery.Pattern, fileInfo.Name())
                 if !matched && !strings.Contains(relPath, searchQuery.Pattern) {
                     return
                 }
             }
 
-            if searchQuery.MinSize > 0 && info.Size() < searchQuery.MinSize {
+            if searchQuery.MinSize > 0 && fileInfo.Size() < searchQuery.MinSize {
                 return
             }
 
-            if searchQuery.MaxSize > 0 && info.Size() > searchQuery.MaxSize {
+            if searchQuery.MaxSize > 0 && fileInfo.Size() > searchQuery.MaxSize {
                 return
             }
 
-            tags := sft.generateTags(info.Name())
+            tags := sft.generateTags(fileInfo.Name())
             if len(searchQuery.Tags) > 0 {
                 tagMatch := false
                 for _, requiredTag := range searchQuery.Tags {
@@ -638,23 +654,31 @@ func (sft *SecureFileTransfer) handleSearch(msg Message) {
             }
 
             h := sha256.New()
-            file, _ := os.Open(path)
-            io.Copy(h, file)
-            file.Close()
+            file, openErr := os.Open(currentPath)
+            if openErr == nil {
+                func() {
+                    defer file.Close()
+                    io.Copy(h, file)
+                }()
+            }
 
             resultsMu.Lock()
             results = append(results, FileMetadata{
                 Name:        relPath,
-                Size:        info.Size(),
+                Size:        fileInfo.Size(),
                 Hash:        hex.EncodeToString(h.Sum(nil)),
-                Permissions: int(info.Mode().Perm()),
+                Permissions: int(fileInfo.Mode().Perm()),
                 Tags:        tags,
             })
             resultsMu.Unlock()
-        }()
+        }(path, info)
 
         return nil
     })
+
+    if err != nil {
+        log.Printf("Walk error: %v", err)
+    }
 
     wg.Wait()
     sft.sendResponse("SEARCH_RESULT", msg.Sender, results)
@@ -792,11 +816,13 @@ func (sft *SecureFileTransfer) sendFileChunk(path string, offset int64, data []b
 }
 
 func (sft *SecureFileTransfer) sendError(errMsg string) {
+    errorPayload, _ := json.Marshal(map[string]string{"error": errMsg})
+    
     errorMsg := Message{
         Type:      "ERROR",
         Sender:    "server",
         Timestamp: time.Now().Unix(),
-        Payload:   json.RawMessage(`{"error":"` + errMsg + `"}`),
+        Payload:   json.RawMessage(errorPayload),
     }
 
     data, err := json.Marshal(errorMsg)
@@ -880,43 +906,49 @@ func aliceServer(wg *sync.WaitGroup) {
 
     conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
-    dkAlice, err := mlkem.GenerateKey768()
+    curve := ecdh.P256()
+    privateKey, err := curve.GenerateKey(rand.Reader)
     if err != nil {
         log.Fatal(err)
     }
 
-    ekBytes := dkAlice.EncapsulationKey().Bytes()
-    ekLen := uint16(len(ekBytes))
+    publicKeyBytes := privateKey.PublicKey().Bytes()
+    keyLen := uint16(len(publicKeyBytes))
     lenBuf := make([]byte, 2)
-    binary.BigEndian.PutUint16(lenBuf, ekLen)
+    binary.BigEndian.PutUint16(lenBuf, keyLen)
 
     if _, err := conn.Write(lenBuf); err != nil {
         log.Fatal(err)
     }
 
-    if _, err := conn.Write(ekBytes); err != nil {
+    if _, err := conn.Write(publicKeyBytes); err != nil {
         log.Fatal(err)
     }
 
-    ctLenBuf := make([]byte, 2)
-    if _, err := io.ReadFull(conn, ctLenBuf); err != nil {
+    peerKeyLenBuf := make([]byte, 2)
+    if _, err := io.ReadFull(conn, peerKeyLenBuf); err != nil {
         log.Fatal(err)
     }
-    ctLen := binary.BigEndian.Uint16(ctLenBuf)
+    peerKeyLen := binary.BigEndian.Uint16(peerKeyLenBuf)
 
-    ciphertext := make([]byte, ctLen)
-    if _, err := io.ReadFull(conn, ciphertext); err != nil {
+    peerPublicKeyBytes := make([]byte, peerKeyLen)
+    if _, err := io.ReadFull(conn, peerPublicKeyBytes); err != nil {
         log.Fatal(err)
     }
 
-    sharedSecretAlice, err := dkAlice.Decapsulate(ciphertext)
+    peerPublicKey, err := curve.NewPublicKey(peerPublicKeyBytes)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sharedSecret, err := privateKey.ECDH(peerPublicKey)
     if err != nil {
         log.Fatal(err)
     }
 
     conn.SetDeadline(time.Time{})
 
-    channel := NewSecureChannel(conn, sharedSecretAlice)
+    channel := NewSecureChannel(conn, sharedSecret)
     transfer := NewSecureFileTransfer(channel, "./server_files")
 
     fmt.Println("Alice: Secure file server ready")
@@ -944,39 +976,49 @@ func bobClient(wg *sync.WaitGroup) {
 
     conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
-    lenBuf := make([]byte, 2)
-    if _, err := io.ReadFull(conn, lenBuf); err != nil {
-        log.Fatal(err)
-    }
-    ekLen := binary.BigEndian.Uint16(lenBuf)
-
-    ekBytes := make([]byte, ekLen)
-    if _, err := io.ReadFull(conn, ekBytes); err != nil {
-        log.Fatal(err)
-    }
-
-    ekBob, err := mlkem.NewEncapsulationKey768(ekBytes)
+    curve := ecdh.P256()
+    privateKey, err := curve.GenerateKey(rand.Reader)
     if err != nil {
         log.Fatal(err)
     }
 
-    sharedSecretBob, ciphertext := ekBob.Encapsulate()
+    peerKeyLenBuf := make([]byte, 2)
+    if _, err := io.ReadFull(conn, peerKeyLenBuf); err != nil {
+        log.Fatal(err)
+    }
+    peerKeyLen := binary.BigEndian.Uint16(peerKeyLenBuf)
 
-    ctLen := uint16(len(ciphertext))
-    ctLenBuf := make([]byte, 2)
-    binary.BigEndian.PutUint16(ctLenBuf, ctLen)
-
-    if _, err := conn.Write(ctLenBuf); err != nil {
+    peerPublicKeyBytes := make([]byte, peerKeyLen)
+    if _, err := io.ReadFull(conn, peerPublicKeyBytes); err != nil {
         log.Fatal(err)
     }
 
-    if _, err := conn.Write(ciphertext); err != nil {
+    peerPublicKey, err := curve.NewPublicKey(peerPublicKeyBytes)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    publicKeyBytes := privateKey.PublicKey().Bytes()
+    keyLen := uint16(len(publicKeyBytes))
+    keyLenBuf := make([]byte, 2)
+    binary.BigEndian.PutUint16(keyLenBuf, keyLen)
+
+    if _, err := conn.Write(keyLenBuf); err != nil {
+        log.Fatal(err)
+    }
+
+    if _, err := conn.Write(publicKeyBytes); err != nil {
+        log.Fatal(err)
+    }
+
+    sharedSecret, err := privateKey.ECDH(peerPublicKey)
+    if err != nil {
         log.Fatal(err)
     }
 
     conn.SetDeadline(time.Time{})
 
-    channel := NewSecureChannel(conn, sharedSecretBob)
+    channel := NewSecureChannel(conn, sharedSecret)
 
     fmt.Println("Bob: Connected to secure file server")
 
